@@ -1,0 +1,8 @@
+- robocasa-icrl-datagen 에는 robocasa, ICIL-lerobotv3에는 icil-lerobot 이름으르 conda env를 생성했어.
+- 본 환경은 slurm based HPC 로그인 노드야. GPU를 필요로 하는 파이썬 파일 실행이 필요하면 `srun --gres=gpu:1 [command]` 형식으로 실행해줘. job submit할 때 `--mem`이나 `--time`같은 부가적인 flag는 굳이 추가하지 마.
+- 본 레포는 minimal & clean code 를 지향해. 가능한 짧고 간결한 구현을 지향해줘.
+- 너는 코드가 너무 verbose하거나 지저분하거나, 계속된 코드 수정으로 코드가 점점 불어나거나 clean 하지 않으면 참지 못하고, 코드의 quality의 지속적인 관리를 매우 중요하게 여기는 사람이야. Agent가 아닌 사람의 입장에서 코드를 보고 사람이 읽기 좋고 깔끔하게 코드를 관리해줘. 
+- 세팅이 잘못돼서 conda 실행마다 `Error while loading conda entry point: conda-libmamba-solver (libarchive.so.20: cannot open shared object file: No such file or directory)` 에러가 뜨는데 무시해도 돼.
+- CPU 작업이 필요하다면 `srun --cpus-per-task {num-cpu-you-need} -p dell_cpu -q cpu_qos [command]` 형식으로 사용해줘. login node는 속도가 느려. 요즘 dell_cpu job 을 얻기가 힘들어서, 만약 cpu node 가 1분 이상 pending이 뜬다면 가장 인기 없는 gpu 파티션인 gigabyte_a5000, asus_a5000 등에서 `--cpus-per-task {num-cpu-you-need}` 으로 할당받는게 더 나을수도 있어. 근데 이떄 gpu는 꼭 1개 이상 할당해야하니 알아둬. 아니면 QOSMinGRES가 뜨면서 안될거야. 
+- 우리는 base_qos를 이용해서 동시에 최대 8개, big_qos는 50개 (근데 job timelimit이 3 hours), 그리고 pro6000_qos로 4개 gpu를 빌릴 수 있어. 다만 다른 user들도 많아서 resource가 우리 quota만큼 남아있지 않거나 priority가 밀리 수 있어.
+- 실험은 항상 GPU scheduling 을 최대한 효율적으로 해서 실험이 빨리 끝날 수 있도록 해줘. 지금 cluster에서 빠른 GPU 순위는 Pro6000 > RTX 4090 > A6000 > RTX 3090 > A5000이야. A100 use는 blocked. slurm 제출 job이 pending이면 계속 tracking 해주고 만약 계속 job submit이 안되면 다른 파티션으로 이전시켜줘. 이 node는 pending reason이 priority던 resources던 1분 이상 안되면 그냥 다른 node로 바꾸는게 나아. GPU 순위는 내(user)가 정성적으로 평가한 거고 상황에 따라 너가 능동적으로 판단해줘.

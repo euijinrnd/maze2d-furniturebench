@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "diffplan"
+version = "0.1.0"
+description = "Minimal trajectory-diffusion planners for Maze2D and FurnitureBench"
+requires-python = ">=3.8"
+
+# Dependencies are NOT listed here on purpose. This project needs a very specific,
+# order-sensitive install (gym 0.21 must be built with setuptools 65.5.0, isaacgym
+# must be installed --no-deps, numpy must stay <1.24). Use env/create_env.sh.
+
+[tool.setuptools]
+packages = ["diffplan", "diffplan.tasks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

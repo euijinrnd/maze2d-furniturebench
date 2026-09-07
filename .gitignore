@@ -1,0 +1,21 @@
+# Upstream reference repos (nested git checkouts, cloned by hand).
+implement_resources/
+
+# Demonstrations, extracted features, d4rl caches. Both spellings on purpose: `data/` only
+# matches a real directory, and here `data` is a SYMLINK to /scratch2/$USER/... (see README),
+# which a trailing-slash pattern does not match.
+data
+data/
+
+# Checkpoints, rollout results, slurm logs.
+logs/
+slurm-*.out
+
+# wandb's local spool. Normally lands under logs/<run>/wandb (scripts/train.py passes
+# dir=logdir), but a bare `wandb.init()` from the repo root would drop it here.
+wandb/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
