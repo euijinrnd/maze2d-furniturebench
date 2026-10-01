@@ -40,6 +40,13 @@ class Config:
     # A value model is trained only when discount is not None.
     discount: Optional[float] = None
 
+    # Hierarchical Diffuser (Chen et al., 2024). `jump` = K, the env steps between subgoals;
+    # `n_subgoal` = the high-level sequence length H + 1. A run trains ONE level, named by
+    # `level`, into its own checkpoint; `level == ''` is the flat Diffuser.
+    jump: int = 0
+    n_subgoal: int = 0
+    level: str = ''
+
     # training
     lr: float = 2e-4
     cosine_lr: bool = False  # upstream trains at a constant lr
@@ -147,11 +154,51 @@ CONFIGS = {
         name='maze2d-large', env_id='maze2d-large-v1', horizon=384, n_diffusion_steps=256,
     ),
     'one_leg': OneLegConfig(),
+    # Hierarchical Diffuser. `horizon` is the DENSE span jump * (n_subgoal - 1) + 1 -- naming and
+    # documentation only, since every build site asks level_horizon() for the length its network
+    # sees. Both level lengths must stay divisible by 2 ** (len(dim_mults) - 1) == 4, which is why
+    # the paper's K = 15 (segment length 16) is the natural choice.
+    'maze2d-umaze-hd': Maze2dConfig(
+        name='maze2d-umaze-hd', env_id='maze2d-umaze-v1', horizon=106, n_diffusion_steps=64,
+        jump=15, n_subgoal=8,
+    ),
+    'maze2d-medium-hd': Maze2dConfig(
+        name='maze2d-medium-hd', env_id='maze2d-medium-v1', horizon=226, n_diffusion_steps=256,
+        jump=15, n_subgoal=16,
+    ),
+    'maze2d-large-hd': Maze2dConfig(
+        name='maze2d-large-hd', env_id='maze2d-large-v1', horizon=406, n_diffusion_steps=256,
+        jump=15, n_subgoal=28,
+    ),
+    # K = 7 keeps the segment length at 8: one_leg's fine phase moves millimetres per step, so a
+    # 15-step gap between subgoals is most of an insertion. discount stays None because guidance
+    # costs ~15 points here (docs/one_leg.md) -- `--discount 0.997` trains the return predictors.
+    'one_leg-hd': OneLegConfig(
+        name='one_leg-hd', horizon=106, jump=7, n_subgoal=16, discount=None,
+    ),
 }
 
 
+def level_horizon(cfg) -> int:
+    """Length of the sequence this run's network sees: the flat horizon, or this level's."""
+    if not cfg.level:
+        return cfg.horizon
+    assert cfg.jump > 1 and cfg.n_subgoal > 1, '--level needs a hierarchical config (--jump/--n_subgoal)'
+    assert cfg.level in ('high', 'low'), "level must be 'high' or 'low', got %r" % cfg.level
+    # High level: the subsampled trajectory [s_0, s_K, ..., s_HK]. Low level: one gap, endpoints
+    # included, hence K + 1 (Chen et al., eq. 10-11).
+    return cfg.n_subgoal if cfg.level == 'high' else cfg.jump + 1
+
+
 def run_name(cfg) -> str:
-    """Directory name for a run: '<env_id>/H<horizon>_T<T>_s<seed>'."""
+    """Directory name for a run: '<env_id>/H<horizon>_T<T>_s<seed>'.
+
+    A hierarchical run gets '<env_id>/HD<K>x<n_subgoal>_T<T>_s<seed>/<level>', so its two levels
+    are siblings under one run directory and eval can find the low level from the high one.
+    """
+    if cfg.level:
+        return '{}/HD{}x{}_T{}_s{}/{}'.format(cfg.env_id, cfg.jump, cfg.n_subgoal,
+                                              cfg.n_diffusion_steps, cfg.seed, cfg.level)
     return '{}/H{}_T{}_s{}'.format(cfg.env_id, cfg.horizon, cfg.n_diffusion_steps, cfg.seed)
 
 
@@ -163,6 +210,10 @@ def run_name(cfg) -> str:
 _SMOKE = {
     'horizon': 8,
     'n_diffusion_steps': 4,
+    # Hierarchical only: segment length 4, both level lengths divisible by 4. A flat config keeps
+    # level='' and so stays flat however small jump gets.
+    'jump': 3,
+    'n_subgoal': 8,
     'n_train_steps': 20,
     'batch_size': 2,
     'grad_accum': 1,

@@ -35,7 +35,9 @@ from scripts.train import build_models, is_maze2d  # noqa: E402
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument('--checkpoint', required=True)
+    p.add_argument('--checkpoint', required=True, help='the HIGH level, for a hierarchical run')
+    p.add_argument('--low-checkpoint', default=None,
+                   help='hierarchical runs; default: the sibling low/ of --checkpoint')
     p.add_argument('--n-episodes', type=int, default=None, help='default: cfg.n_eval_episodes')
     p.add_argument('--episode-shard', default=None, help='"i/n", 0 <= i < n')
     p.add_argument('--seed', type=int, default=0, help='episode e uses seed + e')
@@ -64,6 +66,30 @@ def load_checkpoint(path, device, use_guide=False):
     return ckpt['step'], cfg, diffusion, normalizer, guide
 
 
+def load_low_level(args, cfg, normalizer, device):
+    """-> the low-level diffuser paired with a hierarchical --checkpoint, or None.
+
+    A hierarchical run trains its two levels as two jobs, so the single-checkpoint pairing
+    invariant has to be re-established here: the levels must agree on K, on the number of subgoals
+    and on the normalizer, or the subgoals the high level emits mean something else to the low one.
+    """
+    if not cfg.level:
+        return None
+    assert cfg.level == 'high', '--checkpoint must be the high level of a hierarchical run'
+    assert not args.guide, 'plan_hd does not use guidance; see diffplan/diffusion.py'
+    run = os.path.dirname(os.path.dirname(os.path.abspath(args.checkpoint)))
+    path = args.low_checkpoint or os.path.join(run, 'low', os.path.basename(args.checkpoint))
+    _, low_cfg, low, low_norm, _ = load_checkpoint(path, device)
+    assert (low_cfg.level, low_cfg.jump, low_cfg.n_subgoal) == ('low', cfg.jump, cfg.n_subgoal), (
+        'level mismatch: high is HD%dx%d, %s is %r HD%dx%d'
+        % (cfg.jump, cfg.n_subgoal, path, low_cfg.level, low_cfg.jump, low_cfg.n_subgoal))
+    assert all(np.array_equal(getattr(low_norm, a)[k], getattr(normalizer, a)[k])
+               for a in ('loc', 'scale') for k in normalizer.loc), (
+        'the two levels were fitted on different data: %s' % path)
+    print('[ eval ] low level: %s' % path, flush=True)
+    return low
+
+
 def summarize(rows):
     stats = {'n_episodes': len(rows)}
     for k in rows[0] if rows else ():
@@ -82,6 +108,7 @@ def main(argv=None):
         k, v = kv.split('=')
         cast = _parse_bool if isinstance(getattr(cfg, k), bool) else type(getattr(cfg, k))
         cfg = dataclasses.replace(cfg, **{k: cast(v)})
+    low = load_low_level(args, cfg, normalizer, device)
     print('[ eval ] step %s | %s | guide %s' % (step, cfg, guide is not None), flush=True)
 
     if is_maze2d(cfg):
@@ -102,11 +129,11 @@ def main(argv=None):
         torch.manual_seed(args.seed + e)
         np.random.seed(args.seed + e)
         if is_maze2d(cfg):
-            result = rollout(env, diffusion, normalizer, cfg, seed=args.seed + e)
+            result = rollout(env, diffusion, normalizer, cfg, seed=args.seed + e, low=low)
             if args.plot:
                 plot_plan(env, result['plan'], os.path.join(outdir, 'plan_%d.png' % e))
         else:
-            result = rollout(env, diffusion, normalizer, cfg, guide=guide)
+            result = rollout(env, diffusion, normalizer, cfg, guide=guide, low=low)
         rows.append({k: float(v) for k, v in result.items() if np.isscalar(v)})
         print('[ eval ] episode %d | %s' % (e, ' '.join('%s %.3f' % kv for kv in sorted(rows[-1].items()))), flush=True)
 

@@ -12,7 +12,7 @@ import gym
 import numpy as np
 from furniture_bench.perception.image_utils import resize, resize_crop
 
-from diffplan.diffusion import plan
+from diffplan.diffusion import plan, plan_hd
 from diffplan.tasks.furniture_data import decode_action, encode_state
 
 
@@ -38,14 +38,23 @@ class OneLegEnv:
         return self._obs(obs), float(np.reshape(reward, -1)[0]), bool(np.reshape(done, -1)[0])
 
 
-def rollout(env, diffusion, normalizer, cfg, guide=None):
-    """One closed-loop episode: plan H steps, execute `replan_every` absolute targets, repeat."""
+def rollout(env, diffusion, normalizer, cfg, guide=None, low=None):
+    """One closed-loop episode: plan H steps, execute `replan_every` absolute targets, repeat.
+
+    With a low-level model this is the closed-loop branch of Hierarchical Diffuser's Alg. 3: only
+    the first low-level segment is generated, since we replan long before the second one starts.
+    """
     device = str(next(diffusion.parameters()).device)
     guide_kwargs = dict(guide_scale=cfg.guide_scale, t_stopgrad=cfg.t_stopgrad, n_guide_steps=cfg.n_guide_steps) if guide else {}
     (robot_state, images), total_reward, steps, done = env.reset(), 0.0, 0, False
     while steps < cfg.max_steps and not done:
-        actions, _ = plan(diffusion, normalizer, {0: encode_state(robot_state)}, batch_size=cfg.plan_batch_size,
-                          images=images, guide=guide, device=device, **guide_kwargs)
+        cond = {0: encode_state(robot_state)}
+        if low is not None:
+            actions, _ = plan_hd(diffusion, low, normalizer, cond, cfg.jump, images=images,
+                                 n_segments=1, device=device)
+        else:
+            actions, _ = plan(diffusion, normalizer, cond, batch_size=cfg.plan_batch_size,
+                              images=images, guide=guide, device=device, **guide_kwargs)
         for target in actions[0][:cfg.replan_every]:
             (robot_state, images), reward, done = env.step(decode_action(target, robot_state))
             total_reward += reward

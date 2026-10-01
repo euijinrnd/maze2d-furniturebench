@@ -25,7 +25,7 @@ def _quiet():
 with _quiet():
     import d4rl  # noqa: F401
 
-from diffplan.diffusion import plan
+from diffplan.diffusion import plan, plan_hd
 
 # parse_maze() encodes the maze with WALL=10, EMPTY=11, GOAL=12.
 WALL = 10
@@ -95,7 +95,7 @@ def load_episodes(env):
     return episodes
 
 
-def rollout(env, diffusion, normalizer, cfg, seed=None):
+def rollout(env, diffusion, normalizer, cfg, seed=None, low=None):
     """One goal-conditioned episode: plan ONCE, then track the plan open loop.
 
     THE DIFFUSED ACTIONS ARE THROWN AWAY. That is upstream's scripts/plan_maze2d.py, not a
@@ -115,16 +115,22 @@ def rollout(env, diffusion, normalizer, cfg, seed=None):
 
     # Inpaint start and goal. The goal is a full observation, so we ask for zero VELOCITY at
     # arrival too -- otherwise the plan may blow through the goal at speed and the controller
-    # chases it back out. Keys must match the training-time cond_steps (0, -1).
+    # chases it back out. Keys must match the training-time cond_steps (0, -1), which for a
+    # hierarchical run means the last SUBGOAL rather than the last env step.
+    last = cfg.n_subgoal - 1 if low is not None else cfg.horizon - 1
     cond = {
         0: np.asarray(observation, dtype=np.float32),
-        cfg.horizon - 1: np.array([target[0], target[1], 0.0, 0.0], dtype=np.float32),
+        last: np.array([target[0], target[1], 0.0, 0.0], dtype=np.float32),
     }
 
     # The device comes from the MODEL, not from cfg: cfg came out of the checkpoint, so cfg.device
     # is where *training* ran, while eval resolves its own device and only moves the weights.
     device = str(next(diffusion.parameters()).device)
-    _, observations = plan(diffusion, normalizer, cond, batch_size=cfg.plan_batch_size, device=device)
+    # plan_hd returns the same dense per-env-step sequence, so the controller below is unchanged.
+    if low is not None:
+        _, observations = plan_hd(diffusion, low, normalizer, cond, cfg.jump, device=device)
+    else:
+        _, observations = plan(diffusion, normalizer, cond, batch_size=cfg.plan_batch_size, device=device)
     waypoints = observations[0]
 
     total_reward, steps = 0.0, 0

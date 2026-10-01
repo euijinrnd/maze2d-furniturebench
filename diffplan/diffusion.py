@@ -188,14 +188,15 @@ class ReturnPredictor(nn.Module):
 def plan(diffusion, normalizer, cond, batch_size=1, images=None, guide=None, device='cuda', **guide_kwargs):
     """Normalize -> sample -> (optionally) rank -> unnormalize.
 
-    cond maps timestep -> np.ndarray[obs_dim] in RAW units; images is the raw uint8 [n_cams, H, W, 3]
-    frame the plan is conditioned on. Returns (actions, observations) as raw-unit numpy arrays
-    [batch_size, H, dim], with row 0 the best plan when a guide is given.
+    cond maps timestep -> np.ndarray[obs_dim] in RAW units, or [batch_size, obs_dim] to pin a
+    different value per sample (plan_hd gives every row its own pair of subgoals); images is the
+    raw uint8 [n_cams, H, W, 3] frame the plan is conditioned on. Returns (actions, observations)
+    as raw-unit numpy arrays [batch_size, H, dim], with row 0 the best plan when a guide is given.
     """
     cond_t = {}
     for h, obs in cond.items():
         obs = torch.as_tensor(normalizer.normalize(np.asarray(obs, dtype=np.float32), 'observations'), device=device)
-        cond_t[int(h)] = obs.reshape(1, -1).expand(batch_size, -1)
+        cond_t[int(h)] = obs.reshape(-1, obs.shape[-1]).expand(batch_size, -1)
     ctx = None
     if images is not None:
         ctx = diffusion.encode(torch.as_tensor(np.asarray(images), device=device)[None]).expand(batch_size, -1)
@@ -211,3 +212,35 @@ def plan(diffusion, normalizer, cond, batch_size=1, images=None, guide=None, dev
     actions = normalizer.unnormalize_torch(x[:, :, :d], 'actions') if d else x[:, :, :d]
     return (actions.cpu().numpy(),
             normalizer.unnormalize_torch(x[:, :, d:], 'observations').cpu().numpy())
+
+
+@torch.no_grad()
+def plan_hd(high, low, normalizer, cond, jump, images=None, n_segments=None, device='cuda'):
+    """Hierarchical Diffuser planning: sparse subgoals, then one dense segment per gap.
+
+    `cond` conditions the HIGH level in raw units -- {0: current state}, plus {n_subgoal - 1: goal}
+    for maze2d. The low level then fills every gap with both endpoints inpainted, all segments in
+    ONE batch (Chen et al., 2024, Alg. 1-3). Returns the stitched dense (actions, observations) of
+    length jump * n_segments + 1, with the same leading batch axis of 1 that plan() gives, so the
+    rollouts keep indexing [0].
+
+    `n_segments=1` is the closed-loop branch of Alg. 3: only the first segment is needed when we
+    replan after a few steps, and it is the only one whose start matches the frame in `images`.
+
+    No guidance: maze2d trains no value model, one_leg's guide costs success rate (docs/one_leg.md),
+    and plan()'s value ranking would reorder a batch whose rows are consecutive segments.
+    """
+    _, subgoals = plan(high, normalizer, cond, images=images, device=device)
+    g = subgoals[0]  # [n_subgoal, observation_dim], raw units
+    n = len(g) - 1 if n_segments is None else int(n_segments)
+    assert 1 <= n < len(g), 'asked for %d segments from %d subgoals' % (n, len(g))
+    assert images is None or n == 1, 'only the first segment starts at the conditioning frame'
+
+    actions, observations = plan(low, normalizer, {0: g[:n], jump: g[1:n + 1]},
+                                 batch_size=n, images=images, device=device)
+
+    def stitch(z):
+        # Segment i ends where segment i + 1 begins: [n, jump + 1, d] -> [1, n * jump + 1, d].
+        return np.concatenate(list(z[:, :-1]) + [z[-1, -1:]])[None]
+
+    return stitch(actions), stitch(observations)

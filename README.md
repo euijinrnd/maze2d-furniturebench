@@ -17,6 +17,9 @@ one core:
   executes the first `replan_every` planned absolute end-effector targets, replans, and can
   optionally rank / guide a batch of samples with a noise-aware return predictor.
 
+**Hierarchical Diffuser** (Chen et al., 2024) sits on top of the same core as a second planning
+mode -- see [below](#hierarchical-diffuser).
+
 Everything is flat modules and plain dataclasses, and every checkpoint is self-contained
 (weights, EMA weights, normalizer statistics and config in one `.pt`).
 
@@ -25,10 +28,10 @@ Everything is flat modules and plain dataclasses, and every checkpoint is self-c
 | Path | What it is |
 | --- | --- |
 | `diffplan/nn.py` | `TemporalUnet` (the x0 model), `TemporalValue` (the guide), both taking an optional context vector; `ImageEncoder` (ResNet18-GN + spatial softmax per camera). |
-| `diffplan/diffusion.py` | `cosine_beta_schedule`, `apply_conditioning`, `GaussianDiffusion` (train / sample / guided sample, owns the encoder), `ReturnPredictor`, `plan()`. |
-| `diffplan/dataset.py` | `Normalizer` (`[min, max] -> [-1, 1]`) and `TrajectoryDataset` (windowed episodes, the `cond` dict, discounted return-to-go). |
+| `diffplan/diffusion.py` | `cosine_beta_schedule`, `apply_conditioning`, `GaussianDiffusion` (train / sample / guided sample, owns the encoder), `ReturnPredictor`, `plan()`, `plan_hd()`. |
+| `diffplan/dataset.py` | `Normalizer` (`[min, max] -> [-1, 1]`) and `TrajectoryDataset` (windowed episodes -- optionally strided and state-only -- the `cond` dict, discounted return-to-go). |
 | `diffplan/trainer.py` | One loop that steps both models with EMA, one self-contained checkpoint. |
-| `diffplan/config.py` | A shared `Config` dataclass with `Maze2dConfig` / `OneLegConfig` on top, the `CONFIGS` registry, `run_name`, two-pass argparse `load_config` (`--smoke` shrinks everything to CPU size). |
+| `diffplan/config.py` | A shared `Config` dataclass with `Maze2dConfig` / `OneLegConfig` on top, the `CONFIGS` registry, `run_name`, `level_horizon`, two-pass argparse `load_config` (`--smoke` shrinks everything to CPU size). |
 | `diffplan/tasks/maze2d.py` | d4rl re-segmentation, `make_env`, goal-conditioned open-loop `rollout`, `plot_plan`. |
 | `diffplan/tasks/furniture_data.py` | Rotation utilities (quat / rot6d), the 16-d state and 10-d absolute-action layout, `load_episodes`, `FurnitureDataset` (adds the frame images). No simulator import. |
 | `diffplan/tasks/furniture.py` | `OneLegEnv` (FurnitureSim with the collector's image pipeline) and the chunked closed-loop `rollout`. Imports isaacgym first. |
@@ -171,6 +174,50 @@ per batch (280 ms) than the whole training step (115 ms on a 3090, ~8 it/s).
 Evaluate one_leg on `suma_rtx4090` when possible: contact physics differs across GPU
 generations enough that the scripted expert scores 5/10 on a 4090 and 2/10 on a 3090, and
 `n >= 100` episodes -- per-episode outcomes are chaotic and a 20-episode number is noise.
+
+## Hierarchical Diffuser
+
+The `*-hd` configs train [Hierarchical Diffuser](implement_resources/algorithms_papers/) (Chen et
+al., ICLR 2024, "HD" / "SHD"), which is the *same* `GaussianDiffusion` trained twice, on two views
+of the same windows:
+
+* `--level high` -- the **Sparse Diffuser**: every `jump`-th state of a window with the actions
+  dropped, `x^SD = [s_0, s_K, ..., s_HK]` (`stride` / `include_actions` on `TrajectoryDataset`).
+  An `n_subgoal`-long sequence covers `jump * (n_subgoal - 1) + 1` env steps, so the receptive
+  field grows without the network growing with it -- the paper's main finding.
+* `--level low` -- a plain Diffuser over **one gap**: `jump + 1` steps with *both* endpoints
+  inpainted, which is already expressible as `cond_steps=(0, -1)`.
+
+`plan_hd()` samples subgoals from the high level (pinning the current state, plus the goal for
+maze2d), fills every gap with one batched low-level call, and stitches the segments back into the
+dense sequence `plan()` would have returned -- so the maze2d PD controller and the one_leg
+execution loop are unchanged. maze2d plans once, open loop; one_leg generates the first segment
+only and replans, which is Alg. 3's closed-loop branch.
+
+| config | `jump` (K) | `n_subgoal` | dense span | flat / HD paper |
+| --- | --- | --- | --- | --- |
+| `maze2d-umaze-hd` | 15 | 8 | 106 | 128 / 120 |
+| `maze2d-medium-hd` | 15 | 16 | 226 | 256 / 255 |
+| `maze2d-large-hd` | 15 | 28 | 406 | 384 / 390 |
+| `one_leg-hd` | 7 | 16 | 106 | 32 / n-a |
+
+Both `n_subgoal` and `jump + 1` must be divisible by `2 ** (len(dim_mults) - 1)` == 4, which is
+exactly why the paper's `K = 15` (segment length 16) is the natural choice.
+
+The two levels are two jobs and two checkpoints under one run directory. Eval takes the high one
+and finds `low/` beside it, asserting the pair agrees on `jump`, `n_subgoal` and the normalizer --
+the pairing invariant a single checkpoint used to give for free.
+
+```bash
+for l in high low; do sbatch slurm/train.sbatch --config maze2d-large-hd --level $l; done
+python scripts/eval.py --checkpoint logs/maze2d-large-v1/HD15x28_T256_s0/high/state_latest.pt
+```
+
+Guidance is deliberately not wired into `plan_hd`: maze2d trains no value model, one_leg's guide
+costs ~15 points of success rate (`docs/one_leg.md`), and `plan()`'s value ranking would reorder a
+batch whose rows are consecutive segments. `one_leg-hd` therefore sets `discount=None` and trains
+no return predictor at all; `--discount 0.997` brings them back. A hierarchical run also has no
+mid-training probe, since planning needs both levels and a job trains one.
 
 ## Results
 

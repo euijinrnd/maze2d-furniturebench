@@ -18,7 +18,7 @@ import os
 import numpy as np
 import torch
 
-from diffplan.config import config_to_dict, load_config, run_name
+from diffplan.config import config_to_dict, level_horizon, load_config, run_name
 from diffplan.dataset import Normalizer, TrajectoryDataset
 from diffplan.diffusion import GaussianDiffusion, ReturnPredictor
 from diffplan.nn import ImageEncoder, TemporalUnet, TemporalValue
@@ -42,8 +42,16 @@ def build_episodes(cfg):
 
 
 def build_dataset(cfg, episodes):
-    kw = dict(horizon=cfg.horizon, cond_steps=tuple(cfg.cond_steps), discount=cfg.discount,
+    """The window view this run's level is trained on. Both levels fit their normalizer on the
+    same episodes, so the two jobs of a hierarchical run agree on it without talking."""
+    kw = dict(horizon=level_horizon(cfg), cond_steps=tuple(cfg.cond_steps), discount=cfg.discount,
               normalizer=Normalizer.fit(episodes), pad_last=cfg.pad_last)
+    if cfg.level == 'high':
+        # x^SD: every K-th state of the window, actions dropped (Chen et al., eq. 11).
+        kw.update(stride=cfg.jump, include_actions=False)
+    elif cfg.level == 'low':
+        # One gap, both endpoints pinned; (0, -1) resolves to {0, jump} inside the dataset.
+        kw.update(cond_steps=(0, -1))
     if is_maze2d(cfg):
         return TrajectoryDataset(episodes, **kw)
     from diffplan.tasks.furniture_data import FurnitureDataset
@@ -57,18 +65,22 @@ def build_models(cfg, observation_dim, action_dim):
     encoder = None if is_maze2d(cfg) else ImageEncoder(crop=cfg.crop, backbone=cfg.encoder)
     cond_dim = 0 if encoder is None else encoder.out_dim
     dim_mults = tuple(cfg.dim_mults)
+    # The high level models states only, so the checkpoint's normalizer (which still carries both
+    # keys) must not be trusted for the action width here.
+    action_dim = 0 if cfg.level == 'high' else action_dim
+    horizon = level_horizon(cfg)
     transition_dim = observation_dim + action_dim
 
-    model = TemporalUnet(cfg.horizon, transition_dim, dim=cfg.dim, dim_mults=dim_mults, cond_dim=cond_dim)
+    model = TemporalUnet(horizon, transition_dim, dim=cfg.dim, dim_mults=dim_mults, cond_dim=cond_dim)
     diffusion = GaussianDiffusion(
-        model, horizon=cfg.horizon, transition_dim=transition_dim, action_dim=action_dim,
+        model, horizon=horizon, transition_dim=transition_dim, action_dim=action_dim,
         n_timesteps=cfg.n_diffusion_steps, loss_type=cfg.loss_type, clip_denoised=cfg.clip_denoised,
         clip_value=cfg.clip, predict_epsilon=cfg.predict_epsilon, action_weight=cfg.action_weight,
         encoder=encoder)
 
     value_model = None
     if cfg.discount is not None:
-        value_net = TemporalValue(cfg.horizon, transition_dim, dim=cfg.dim, dim_mults=dim_mults,
+        value_net = TemporalValue(horizon, transition_dim, dim=cfg.dim, dim_mults=dim_mults,
                                   action_dim=action_dim, cond_dim=cond_dim)
         value_model = ReturnPredictor(value_net, n_timesteps=cfg.n_diffusion_steps, action_dim=action_dim)
     return diffusion, value_model
@@ -86,9 +98,11 @@ def build_probe(cfg, dataset, logdir, with_images=True):
     be wrong: a plan that clips a wall, or an inverted normalizer.
 
     None for furniture: probing it means stepping the simulator, i.e. importing isaacgym into the
-    training process, which the note at the top of this file forbids.
+    training process, which the note at the top of this file forbids. None for a hierarchical run
+    too: planning needs both levels and this job trains one, so the honest reading is
+    scripts/eval.py once both have finished.
     """
-    if not is_maze2d(cfg):
+    if not is_maze2d(cfg) or cfg.level:
         return None
 
     from diffplan.tasks.maze2d import make_env, plot_plan, rollout
@@ -199,7 +213,7 @@ def main(argv=None):
     print('[ train ] %s' % logdir)
     print('[ train ] %d episodes | %d windows | obs %d | act %d | transition %d | horizon %d'
           % (len(episodes), len(dataset), dataset.observation_dim, dataset.action_dim,
-             dataset.transition_dim, cfg.horizon))
+             dataset.transition_dim, level_horizon(cfg)))
     print('[ train ] unet params: %.2fM' % (count_params(diffusion.model) / 1e6))
     if value_model is not None:
         print('[ train ] value params: %.2fM' % (count_params(value_model) / 1e6))

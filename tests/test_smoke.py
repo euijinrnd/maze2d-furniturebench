@@ -1,12 +1,15 @@
 """CPU-only invariants: channel layout, windows, normalizer, rotations, conditioning, a tiny overfit."""
+import dataclasses
+
 import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from diffplan.config import CONFIGS, load_config, run_name
+from diffplan.config import CONFIGS, level_horizon, load_config, run_name
 from diffplan.dataset import Normalizer, TrajectoryDataset
-from diffplan.diffusion import GaussianDiffusion, ReturnPredictor, apply_conditioning, cosine_beta_schedule, plan
+from diffplan.diffusion import (GaussianDiffusion, ReturnPredictor, apply_conditioning,
+                                cosine_beta_schedule, plan, plan_hd)
 from diffplan.nn import ImageEncoder, TemporalUnet, TemporalValue
 from diffplan.tasks import furniture_data as fd
 
@@ -145,6 +148,27 @@ def test_configs():
     assert cfg.smoke and cfg.horizon == 16 and cfg.device == 'cpu' and run_name(cfg) == 'one_leg/H16_T4_s0'
 
 
+def test_hierarchical_configs():
+    for key, cfg in CONFIGS.items():
+        if not cfg.jump:
+            assert cfg.level == '' and level_horizon(cfg) == cfg.horizon
+            continue
+        # `horizon` on a hierarchical config is the dense span it plans over.
+        assert cfg.horizon == cfg.jump * (cfg.n_subgoal - 1) + 1, key
+        n_down = 2 ** (len(cfg.dim_mults) - 1)
+        for level in ('high', 'low'):
+            h = level_horizon(dataclasses.replace(cfg, level=level))
+            assert h % n_down == 0, '%s %s: horizon %d' % (key, level, h)
+        assert level_horizon(dataclasses.replace(cfg, level='low')) == cfg.jump + 1
+    cfg = load_config(['--config', 'maze2d-large-hd', '--level', 'high'])
+    assert (cfg.jump, cfg.n_subgoal) == (15, 28) and level_horizon(cfg) == 28
+    assert run_name(cfg) == 'maze2d-large-v1/HD15x28_T256_s0/high'
+    # --smoke shrinks a hierarchical run but must never make a flat one hierarchical.
+    assert load_config(['--config', 'maze2d-large', '--smoke']).level == ''
+    smoke = load_config(['--config', 'maze2d-large-hd', '--smoke', '--level', 'low'])
+    assert level_horizon(smoke) == 4 and run_name(smoke) == 'maze2d-large-v1/HD3x8_T4_s0/low'
+
+
 def test_overfit_reproduces_conditioned_endpoints_and_guidance_runs():
     torch.manual_seed(0)
     np.random.seed(0)
@@ -173,3 +197,42 @@ def test_overfit_reproduces_conditioned_endpoints_and_guidance_runs():
     assert actions.shape == (4, horizon, 2) and obs.shape == (4, horizon, 2)
     assert np.allclose(obs[:, 0], start, atol=1e-3) and np.allclose(obs[:, -1], goal, atol=1e-3)
     assert actions[0, :-1, 0].mean() > 0.04 and abs(actions[0, :-1, 1].mean()) < 0.06
+
+
+def test_plan_hd_stitches_segments_between_the_conditioned_endpoints():
+    """Two overfitted Diffusers: sparse subgoals every K steps, dense segments filling the gaps."""
+    torch.manual_seed(0)
+    np.random.seed(0)
+    jump, n_subgoal, eps = 3, 8, ramp_episodes(length=32)
+    norm = Normalizer.fit(eps)
+    models = {}
+    for level, ds in (('high', TrajectoryDataset(eps, n_subgoal, cond_steps=(0, -1), normalizer=norm,
+                                                 stride=jump, include_actions=False)),
+                      ('low', TrajectoryDataset(eps, jump + 1, cond_steps=(0, -1), normalizer=norm))):
+        unet = TemporalUnet(ds.horizon, ds.transition_dim, dim=16, dim_mults=(1, 2, 4))
+        d = GaussianDiffusion(unet, ds.horizon, ds.transition_dim, ds.action_dim, n_timesteps=20)
+        opt = torch.optim.Adam(d.parameters(), lr=1e-3)
+        loader = DataLoader(ds, batch_size=32, shuffle=True)
+        for step, batch in enumerate(iter(lambda: next(iter(loader)), None)):
+            loss, _ = d.loss(batch['x'], batch['cond'])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if step == 400:
+                break
+        models[level] = d.eval()
+
+    start, goal = eps[0]['observations'][0], eps[0]['observations'][(n_subgoal - 1) * jump]
+    actions, obs = plan_hd(models['high'], models['low'], norm, {0: start, n_subgoal - 1: goal},
+                           jump, device='cpu')
+    dense = jump * (n_subgoal - 1) + 1
+    assert actions.shape == (1, dense, 2) and obs.shape == (1, dense, 2)
+    assert np.allclose(obs[0, 0], start, atol=1e-3) and np.allclose(obs[0, -1], goal, atol=1e-3)
+    # The subgoals land at every jump-th step of the stitched plan (each is pinned as one
+    # segment's end and the next one's start), and on a ramp they must advance monotonically.
+    assert (np.diff(obs[0, ::jump, 0]) > 0).all()
+
+    # The closed-loop branch generates the first segment only.
+    _, first = plan_hd(models['high'], models['low'], norm, {0: start, n_subgoal - 1: goal}, jump,
+                       n_segments=1, device='cpu')
+    assert first.shape == (1, jump + 1, 2) and np.allclose(first[0, 0], start, atol=1e-3)
