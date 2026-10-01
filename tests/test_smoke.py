@@ -62,12 +62,31 @@ def test_dataset_windows_values_and_padding():
     assert batch['x'].shape == (3, 4, 4) and batch['cond'][0].shape == (3, 2)
 
 
+def test_strided_windows_are_the_high_level_view():
+    """The high level sees every K-th state of a window, with the actions dropped (eq. 11)."""
+    eps = ramp_episodes(n_ep=2, length=10)
+    ds = TrajectoryDataset(eps, horizon=4, stride=3, include_actions=False, cond_steps=(0, -1))
+    # A window now spans (4 - 1) * 3 + 1 = 10 transitions, so exactly one start per episode.
+    assert len(ds) == 2 and ds.action_dim == 0 and ds.transition_dim == ds.observation_dim
+    assert np.allclose(ds[0]['x'], ds.normalizer.normalize(eps[0]['observations'][::3], 'observations'))
+    assert np.allclose(ds[0]['cond'][3], ds[0]['x'][3])
+    # Padding still clamps to the final transition, stride or no stride.
+    padded = TrajectoryDataset(eps, horizon=4, stride=3, pad_last=True)
+    assert len(padded) == 20 and np.allclose(padded[9]['x'][-1], padded[9]['x'][-2])
+
+
 def test_apply_conditioning_only_touches_observations():
     x = torch.zeros(2, 5, 4)
     out = apply_conditioning(x, {0: torch.ones(2, 2), 4: 2 * torch.ones(2, 2)}, action_dim=2)
     assert out[:, 0, 2:].eq(1).all() and out[:, 4, 2:].eq(2).all() and out[:, :, :2].eq(0).all()
     with pytest.raises(RuntimeError):
         apply_conditioning(torch.zeros(2, 5, 4), {0: torch.ones(2, 3)}, action_dim=2)
+
+
+def test_apply_conditioning_with_no_action_channels():
+    """The high level has action_dim 0, so conditioning starts at channel 0."""
+    out = apply_conditioning(torch.zeros(2, 5, 3), {0: torch.ones(2, 3)}, action_dim=0)
+    assert out[:, 0].eq(1).all() and out[:, 1:].eq(0).all()
 
 
 def test_schedule_constants():

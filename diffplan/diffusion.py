@@ -145,7 +145,10 @@ class GaussianDiffusion(nn.Module):
         target = noise if self.predict_epsilon else x
         elem = F.mse_loss(x_recon, target, reduction='none') if self.loss_type == 'l2' else (x_recon - target).abs()
         loss = (elem * self.loss_weights).mean()
-        return loss, {'loss': loss.detach(), 'a0_loss': elem[:, 0, :self.action_dim].mean().detach()}
+        info = {'loss': loss.detach()}
+        if self.action_dim:  # a state-only high level has no a_0 to report
+            info['a0_loss'] = elem[:, 0, :self.action_dim].mean().detach()
+        return loss, info
 
 
 class ReturnPredictor(nn.Module):
@@ -203,5 +206,8 @@ def plan(diffusion, normalizer, cond, batch_size=1, images=None, guide=None, dev
         x = x[torch.argsort(values, descending=True)]
 
     d = diffusion.action_dim
-    return (normalizer.unnormalize_torch(x[:, :, :d], 'actions').cpu().numpy(),
+    # A state-only high-level model has d == 0: there is nothing to unnormalize, and the
+    # normalizer's action statistics would broadcast against the empty slice rather than stay empty.
+    actions = normalizer.unnormalize_torch(x[:, :, :d], 'actions') if d else x[:, :, :d]
+    return (actions.cpu().numpy(),
             normalizer.unnormalize_torch(x[:, :, d:], 'observations').cpu().numpy())

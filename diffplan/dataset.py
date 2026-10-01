@@ -98,14 +98,20 @@ class TrajectoryDataset(torch.utils.data.Dataset):
 
     Each item is {'x': [horizon, act_dim + obs_dim], 'cond': {step: observation}} plus, when a
     discount is given, 'value': the normalized discounted return-to-go.
+
+    `stride` takes every `stride`-th transition of the window, and `include_actions=False` drops
+    the action channels: together they are Hierarchical Diffuser's high-level view of a window,
+    x^SD = [s_0, s_K, ..., s_HK] (Chen et al., 2024, eq. 11).
     """
 
     def __init__(self, episodes, horizon, cond_steps=(0,), discount=None, normalizer=None,
-                 pad_last=False):
-        assert horizon > 0
+                 pad_last=False, stride=1, include_actions=True):
+        assert horizon > 0 and stride >= 1
         self.horizon = int(horizon)
         self.discount = discount
         self.pad_last = bool(pad_last)
+        self.stride = int(stride)
+        self.include_actions = bool(include_actions)
 
         # cond_steps is plain DATA -- a tuple of ints, not a subclass hook like upstream's
         # GoalDataset.get_conditions -- precisely so it can be written into the checkpoint. Eval
@@ -116,7 +122,7 @@ class TrajectoryDataset(torch.utils.data.Dataset):
         self.episodes = list(episodes)
         assert len(self.episodes) > 0, 'empty episode list'
         self.observation_dim = int(self.episodes[0]['observations'].shape[-1])
-        self.action_dim = int(self.episodes[0]['actions'].shape[-1])
+        self.action_dim = int(self.episodes[0]['actions'].shape[-1]) if self.include_actions else 0
         self.transition_dim = self.action_dim + self.observation_dim
         self.normalizer = normalizer if normalizer is not None else Normalizer.fit(self.episodes)
 
@@ -127,11 +133,11 @@ class TrajectoryDataset(torch.utils.data.Dataset):
             T = len(ep['observations'])
             assert len(ep['actions']) == T, 'episode %d: len(actions) != len(observations)' % i
             assert len(ep['rewards']) == T, 'episode %d: len(rewards) != len(observations)' % i
-            n_starts = T if self.pad_last else T - self.horizon + 1
+            n_starts = T if self.pad_last else T - (self.horizon - 1) * self.stride
             self.indices.extend((i, s) for s in range(max(0, n_starts)))
         assert len(self.indices) > 0, (
-            'no windows: horizon %d is longer than every episode; use pad_last=True or a shorter '
-            'horizon' % self.horizon)
+            'no windows: a horizon of %d at stride %d is longer than every episode; use '
+            'pad_last=True, a shorter horizon or a smaller stride' % (self.horizon, self.stride))
 
         self.values = None  # type: Optional[np.ndarray]
         if self.discount is not None:
@@ -166,7 +172,7 @@ class TrajectoryDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         ep_idx, start = self.indices[idx]
         ep = self.episodes[ep_idx]
-        rows = start + np.arange(self.horizon)
+        rows = start + np.arange(self.horizon) * self.stride
         if self.pad_last:
             # Clamping the gather index IS "repeat the final transition", with no padded copy of
             # the observation array. Furniture needs it: the terminal frames carry all of the
@@ -175,7 +181,9 @@ class TrajectoryDataset(torch.utils.data.Dataset):
             rows = np.minimum(rows, len(ep['observations']) - 1)
 
         obs = self.normalizer.normalize(ep['observations'][rows], 'observations')
-        act = self.normalizer.normalize(ep['actions'][rows], 'actions')
+        # A high-level window carries no actions at all: the block is zero-width, action_dim is 0,
+        # and every consumer already handles that (apply_conditioning and loss_weights included).
+        act = self.normalizer.normalize(ep['actions'][rows], 'actions') if self.include_actions else obs[:, :0]
         # Channel order is [actions | observations] everywhere.
         batch = {
             'x': np.ascontiguousarray(np.concatenate([act, obs], axis=-1), dtype=np.float32),
