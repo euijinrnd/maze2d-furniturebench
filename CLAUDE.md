@@ -6,3 +6,4 @@
 - CPU 작업이 필요하다면 `srun --cpus-per-task {num-cpu-you-need} -p dell_cpu -q cpu_qos [command]` 형식으로 사용해줘. login node는 속도가 느려. 요즘 dell_cpu job 을 얻기가 힘들어서, 만약 cpu node 가 1분 이상 pending이 뜬다면 가장 인기 없는 gpu 파티션인 gigabyte_a5000, asus_a5000 등에서 `--cpus-per-task {num-cpu-you-need}` 으로 할당받는게 더 나을수도 있어. 근데 이떄 gpu는 꼭 1개 이상 할당해야하니 알아둬. 아니면 QOSMinGRES가 뜨면서 안될거야. 
 - 우리는 base_qos를 이용해서 동시에 최대 8개, big_qos는 50개 (근데 job timelimit이 3 hours), 그리고 pro6000_qos로 4개 gpu를 빌릴 수 있어. 다만 다른 user들도 많아서 resource가 우리 quota만큼 남아있지 않거나 priority가 밀리 수 있어.
 - 실험은 항상 GPU scheduling 을 최대한 효율적으로 해서 실험이 빨리 끝날 수 있도록 해줘. 지금 cluster에서 빠른 GPU 순위는 Pro6000 > RTX 4090 > A6000 > RTX 3090 > A5000이야. A100 use는 blocked. slurm 제출 job이 pending이면 계속 tracking 해주고 만약 계속 job submit이 안되면 다른 파티션으로 이전시켜줘. 이 node는 pending reason이 priority던 resources던 1분 이상 안되면 그냥 다른 node로 바꾸는게 나아. GPU 순위는 내(user)가 정성적으로 평가한 거고 상황에 따라 너가 능동적으로 판단해줘.
+@.claude/harness.md
